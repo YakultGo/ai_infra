@@ -140,15 +140,28 @@ KV Cache 公式中的 `kv_heads` 直接对应注意力头的组织方式，不�
 
 ### 1.8 MoE（专家混合）架构
 
-**入门**：MoE 把 dense FFN 换成“多个专家 + 路由门”——每 token 只激活 top-k 个专家，**总参数大、激活小**，是 DeepSeek-V3 / Mixtral / Qwen-MoE 等前沿模型的核心架构。
+MoE（Mixture-of-Experts）是把 Transformer 的 dense FFN 换成“多个专家 FFN + 一个路由门（gate/router）”的稀疏架构——每来一个 token，路由门给它打分、只激活 top-k 个专家去算，其余跳过。结果是**总参数可以很大、但单 token 的算力只跟 k 成正比**，于是能用“大容量”换“高质量”而不必等比例付算力。这是 DeepSeek-V3 / Mixtral / Qwen-MoE 等前沿开源模型普遍采用的架构，也是为什么“671B 总参的 DeepSeek-V3、单 token 只激活 37B”。
 
-* **本质**：稀疏激活——N 个专家 FFN，router(gate) 给每 token 打分、选 top-k，只算被选中的。总参数 ≈ N×单专家，但每 token 算力 ≈ k×单专家。
-* **算力 / 显存权衡**：总参数↑（容量↑、质量↑）而单 token FLOPs 只随 k（不随 N）→ 性价比高；代价是**所有专家权重都要驻留显存**（显存大），且路由有 all-to-all 通信。
-* **DeepSeek-V3 量级**：671B 总参 / 37B 激活/token——“用 671B 的容量、只花 37B 的算力”。
-* **推理 infra（呼应后文）**：专家路由 all-to-all（DeepEP，4.2）、专家并行 EP（6.1）、分组 GEMM（4.4）、负载均衡（避免热点专家）、细粒度 / 共享专家（DeepSeekMoE）。
-* **与注意力**：DeepSeek-V3 = MoE + MLA（1.5）——稀疏专家 + 低秩 KV 双重压缩。
+* **路由（routing）**：router 通常是一个小线性层，输出每个专家的得分；取 top-k，token 被分发给这几个专家，输出按得分加权聚合。路由策略（top-1 / top-2 / 专家选择 / softmax 等）直接决定负载均衡与质量。
+* **负载均衡（load balancing）**：若某些“热门专家”被反复选中、其他闲置，会出现计算热点（拖慢 all-to-all）和训练塌缩——常见做法是加 auxiliary loss 鼓励均匀路由，或 expert-choice / capacity factor 控制。
+* **细粒度 + 共享专家（DeepSeekMoE）**：把大专家拆成更多小专家（细粒度，更灵活的组合）+ 固定一个“共享专家”处理通用知识（只路由专家处理专门知识）——提升专业化与效率。
+* **算力 / 显存权衡**：总参数↑（容量↑、质量↑）而单 token FLOPs 只随 k → 性价比高；代价是**所有专家权重都要驻留显存**（显存大）、且路由带来跨专家的 all-to-all 通信（呼应 4.2 DeepEP、6.1 EP、4.4 分组 GEMM）。
+* **训练 vs 推理**：训练时 router 与专家一起学、需负载均衡 loss；推理时路由动态（每 token 选专家），专家权重静态驻留——所以 MoE 推理显存 = 全部专家权重，而算力 = 激活部分。
+* **与注意力**：DeepSeek-V3 = MoE（稀疏 FFN）+ MLA（低秩 KV，1.5）——两层稀疏 / 压缩，把“大模型”做到可负担。
 
-> 📝 作业（1.8）：① MoE 为什么能“总参数大、激活小”？代价是什么（显存 / 通信）？② 给定 8 专家 top-2 的 MoE，单 token 激活多少专家？为什么推理时 8 个专家权重都要驻留显存？答清即完成。
+**公司 MoE 架构演进（速查）**
+
+| 论文 | 机构 | 要点 |
+| :--- | :--- | :--- |
+| [GShard](https://arxiv.org/abs/2006.16668) | Google | 早期大规模 MoE + 条件计算 + 自动分片，路由奠基。 |
+| [Switch Transformer](https://arxiv.org/abs/2101.03961) | Google | top-1 路由简化、稳训到万亿参数，MoE 走向主流。 |
+| [ST-MoE](https://arxiv.org/abs/2202.08906) | Google | 稳定性与迁移性研究，解决 MoE 训练 / 微调痛点。 |
+| [Mixtral of Experts](https://arxiv.org/abs/2401.04088) | Mistral | 开源 8×7B MoE，让 MoE 在开源界主流化。 |
+| [DeepSeekMoE](https://arxiv.org/abs/2401.06066) | DeepSeek | 细粒度专家 + 共享专家，迈向极致专业化。 |
+| [DeepSeek-V3](https://arxiv.org/abs/2412.19437) | DeepSeek | MoE + MLA，671B 总参 / 37B 激活。 |
+| [OLMoE](https://arxiv.org/abs/2409.02060) | AI2 | 全开源 MoE（数据 + 模型 + 训练全开放）。 |
+
+> 📝 作业（1.8）：① MoE 为什么能“总参数大、激活小”？推理时显存和算力分别由什么决定？② 给定 8 专家 top-2 的 MoE，单 token 激活几个专家？为什么 8 个专家权重都要驻留显存？③ DeepSeekMoE 的“细粒度 + 共享专家”各解决什么问题？答对 2/3 即完成。
 
 ---
 
