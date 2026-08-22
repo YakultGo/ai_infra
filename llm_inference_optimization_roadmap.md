@@ -6,12 +6,13 @@
 
 ## 目录
 1. [阶段一：理论基础与显存/算力推导](#阶段一理论基础与显存算力推导)
-   - [1.1 核心概念与推导](#11-核心概念与推导)
+   - [1.1 Roofline：算力与带宽瓶颈](#11-roofline算力与带宽瓶颈)
    - [1.2 必读文档与入门参考](#12-必读文档与入门参考)
-   - [1.3 注意力变体与 KV Cache 的关系](#13-注意力变体与-kv-cache-的关系)
-   - [1.4 Transformer 结构与前向算力](#14-transformer-结构与前向算力)
-   - [1.5 GPU 硬件与显存层次](#15-gpu-硬件与显存层次)
-   - [1.6 精度与常用算子元素](#16-精度与常用算子元素)
+   - [1.3 Transformer 结构与前向算力](#13-transformer-结构与前向算力)
+   - [1.4 KV Cache 显存推导](#14-kv-cache-显存推导)
+   - [1.5 注意力变体与 KV Cache 的关系](#15-注意力变体与-kv-cache-的关系)
+   - [1.6 GPU 硬件与显存层次](#16-gpu-硬件与显存层次)
+   - [1.7 精度与常用算子元素](#17-精度与常用算子元素)
 2. [阶段二：核心论文与突破性算法](#阶段二核心论文与突破性算法)
    - [2.1 显存分页与 IO 优化](#21-显存分页与-io-优化)
    - [2.2 量化（Quantization）](#22-量化quantization)
@@ -54,7 +55,7 @@
 
 在深入具体框架和算子之前，首先需要建立对硬件瓶颈（Memory-Bound vs Compute-Bound）的量化认知。
 
-### 1.1 核心概念与推导
+### 1.1 Roofline：算力与带宽瓶颈
 
 **入门直觉**：把 GPU 想象成两个工人——一个算得飞快（**算力**）、一个搬货慢吞吞（**带宽**）。Prefill 一次性送来一大摞货（N 个 token），算力忙不过来 → 算力受限（Compute-Bound）；Decode 每次只搬一个 token、却要把整套参数和 KV 都从显存搬一遍，工人大部分时间在等货 → 带宽受限（Memory-Bound）。本节就是把这种“感觉”量化成可算的数字。
 
@@ -62,12 +63,8 @@
   $$\text{Arithmetic Intensity (算术强度)} = \frac{\text{计算量 (FLOPs)}}{\text{内存访问量 (Bytes)}}$$
   * **Prefill 阶段**：处理 $N$ 个输入 Token。注意力部分计算量约 $O(N^2 \cdot d)$、线性投影约 $O(N \cdot d^2)$，总体前向 FLOPs $\approx 2 \times \text{params} \times N$（2 为矩阵乘的乘累加系数，与 Token 数线性相关）；算术强度高，通常属于 **Compute-Bound（计算密集型）**。
   * **Decode 阶段**：逐字自回归生成，每次仅输入 1 个 Token，参数与 KV Cache 必须逐字节从 HBM/显存搬运至 SRAM，算术强度极低（通常 $<10$），属于 **Memory-Bound（访存受限型）**。
-* **KV Cache 显存精准计算公式**（以 FP16/BF16 2 字节为例）：
-  $$\text{KV Cache Size (Bytes)} = 2 \times \text{layers} \times (2 \times \text{kvHeads} \times \text{headDim}) \times \text{seqLen} \times \text{batchSize}$$
 
-> 算一算：Llama-2-7B（32 层、32 头 MHA、head_dim=128），seq=4K、batch=1、FP16 → KV Cache = 2(字节) × 32(层) × (2×32×128) × 4096 ≈ **2 GB**；到 seq=32K 时膨胀到 ~16 GB，反超模型权重本身（~14 GB）——这就是 decode 阶段显存/带宽成为命门的原因。
-
-> 📝 作业（1.1）：① 不看公式，口算 FP16 下“每层每 token 的 KV 字节 = 2(字节)×2(K,V)×kv_heads×head_dim”，并推广到 GQA；② 解释为何 seq 翻倍时 KV 翻倍、但 decode 单步算术强度几乎不变（仍是带宽瓶颈）。答清即完成。
+> 📝 作业（1.1）：① 给定某模型 prefill / decode 的 FLOPs 与访存字节数，分别判断属 compute-bound 还是 memory-bound；② 为什么 decode 单步算术强度通常 <10？答清即完成。
 
 ### 1.2 必读文档与入门参考
 
@@ -83,7 +80,30 @@
 
 > 📝 作业（1.2）：在 nanoGPT 上加最小 KV Cache（decode 不重算历史），跑通生成；并用 kipply 博文方法推一遍其 FLOPs / 显存。跑通 + 推对即完成。
 
-### 1.3 注意力变体与 KV Cache 的关系
+### 1.3 Transformer 结构与前向算力
+
+**入门**：LLM = 堆叠的 Transformer block，每块 = 注意力 + MLP(FFN) + 残差 + 归一化。理解每块的算力 / 显存构成是推导的基础。
+
+* **block 结构**：Attention（QKV → softmax → V）+ MLP（两层线性 + 激活）+ 残差连接 + LayerNorm / RMSNorm。
+* **前向 FLOPs**：线性层（权重）主导 ≈ 2·P·N（见 1.1）；注意力 ≈ O(N²·d)（长序列才显著）；MLP 隐藏维通常取 4×d。
+* **位置编码演进**：绝对位置 → 正弦 → 可学习 → **RoPE**（旋转 / 相对位置，外推友好，见 2.3）。
+* **残差与归一化**：残差让深网可训；归一化从 LayerNorm → RMSNorm（省均值、更快）。
+
+> 📝 作业（1.3）：① 一个 block 的前向 FLOPs 主要花在哪（attention 还是 MLP）？为什么 MLP 隐藏维常取 4×d？② RoPE 相对绝对位置编码好在哪？答清即完成。
+
+### 1.4 KV Cache 显存推导
+
+KV Cache 是自回归 decode 为避免重算历史而缓存的 K/V——其大小直接决定长上下文 / 长生成的显存压力（先懂 Transformer 自回归，再看 KV 才顺）。
+
+* **精准计算公式**（以 FP16/BF16 2 字节为例）：
+  $$\text{KV Cache Size (Bytes)} = 2 \times \text{layers} \times (2 \times \text{kvHeads} \times \text{headDim}) \times \text{seqLen} \times \text{batchSize}$$
+  > 外层 2 = 字节数，内层 2 = K & V；`kvHeads` 取决于注意力变体（见 1.5）。
+
+> 算一算：Llama-2-7B（32 层、32 头 MHA、head_dim=128），seq=4K、batch=1、FP16 → KV Cache = 2(字节) × 32(层) × (2×32×128) × 4096 ≈ **2 GB**；到 seq=32K 时膨胀到 ~16 GB，反超模型权重本身（~14 GB）——这就是 decode 阶段显存/带宽成为命门的原因。
+
+> 📝 作业（1.4）：① 不看公式，口算 FP16 下“每层每 token 的 KV 字节 = 2(字节)×2(K,V)×kv_heads×head_dim”，并推广到 GQA；② 解释为何 seq 翻倍时 KV 翻倍、但 decode 单步算术强度几乎不变（仍是带宽瓶颈）。答清即完成。
+
+### 1.5 注意力变体与 KV Cache 的关系
 KV Cache 公式中的 `kv_heads` 直接对应注意力头的组织方式，不同变体对显存影响巨大：
 
 * **MHA（标准多头注意力）**：`kv_heads = num_heads`，每个头独立存 K/V，KV Cache 最大。
@@ -93,20 +113,9 @@ KV Cache 公式中的 `kv_heads` 直接对应注意力头的组织方式，不�
 
 > 推导练习：给定 Llama-3-8B（32 层、8 KV 头、head_dim=128、GQA），分别计算 seq_len=8K / 32K、batch=1 时 FP16 下的 KV Cache 大小，体会 GQA 对长上下文显存的缓解。
 
-> 📝 作业（1.3）：① 一句话说清 MHA / MQA / GQA 在 KV 显存上的取舍；② MLA 凭什么砍掉约 93% KV、却又与标准 FlashAttn 不兼容？答清即完成。
+> 📝 作业（1.5）：① 一句话说清 MHA / MQA / GQA 在 KV 显存上的取舍；② MLA 凭什么砍掉约 93% KV、却又与标准 FlashAttn 不兼容？答清即完成。
 
-### 1.4 Transformer 结构与前向算力
-
-**入门**：LLM = 堆叠的 Transformer block，每块 = 注意力 + MLP(FFN) + 残差 + 归一化。理解每块的算力 / 显存构成是推导的基础。
-
-* **block 结构**：Attention（QKV → softmax → V）+ MLP（两层线性 + 激活）+ 残差连接 + LayerNorm / RMSNorm。
-* **前向 FLOPs**：线性层（权重）主导 ≈ 2·P·N（见 1.1）；注意力 ≈ O(N²·d)（长序列才显著）；MLP 隐藏维通常取 4×d。
-* **位置编码演进**：绝对位置 → 正弦 → 可学习 → **RoPE**（旋转 / 相对位置，外推友好，见 2.3）。
-* **残差与归一化**：残差让深网可训；归一化从 LayerNorm → RMSNorm（省均值、更快）。
-
-> 📝 作业（1.4）：① 一个 block 的前向 FLOPs 主要花在哪（attention 还是 MLP）？为什么 MLP 隐藏维常取 4×d？② RoPE 相对绝对位置编码好在哪？答清即完成。
-
-### 1.5 GPU 硬件与显存层次
+### 1.6 GPU 硬件与显存层次
 
 **入门**：推理瓶颈的根因在硬件——理解 SM / Tensor Core / 显存层次，才能懂为什么 decode 是带宽受限。
 
@@ -115,9 +124,9 @@ KV Cache 公式中的 `kv_heads` 直接对应注意力头的组织方式，不�
 * **算术强度与瓶颈**：算术强度 = FLOPs / Bytes；低于 GPU 的“脊点(ops:byte)”→ 带宽受限，高于→算力受限。Decode 每步搬整个权重 + KV 却只算 1 token → 强度极低 → **memory-bound**（呼应 1.1）。
 * **occupancy / kernel launch**：多 kernel 串行有 CPU launch 开销（CUDA Graph 解决，呼应 4.5）。
 
-> 📝 作业（1.5）：① 为什么 decode 把权重从 HBM 搬到 SRAM 却“大部分时间在等”？用算术强度解释。② Tensor Core 与 CUDA core 的区别？答清即完成。
+> 📝 作业（1.6）：① 为什么 decode 把权重从 HBM 搬到 SRAM 却“大部分时间在等”？用算术强度解释。② Tensor Core 与 CUDA core 的区别？答清即完成。
 
-### 1.6 精度与常用算子元素
+### 1.7 精度与常用算子元素
 
 **入门**：推理里到处是精度取舍与几个反复出现的小算子，先认全。
 
@@ -126,7 +135,7 @@ KV Cache 公式中的 `kv_heads` 直接对应注意力头的组织方式，不�
 * **激活**：GELU（早期）→ **SiLU / SwiGLU**（Llama 等，门控式，常与线性层融合）。
 * **采样**：greedy / top-k / top-p / temperature（在 GPU 侧做，见 4.4 采样 kernel）。
 
-> 📝 作业（1.6）：① BF16 与 FP16 各适合什么？为什么推理默认 BF16 / FP16？② RMSNorm 比 LayerNorm 省在哪？答清即完成。
+> 📝 作业（1.7）：① BF16 与 FP16 各适合什么？为什么推理默认 BF16 / FP16？② RMSNorm 比 LayerNorm 省在哪？答清即完成。
 
 ---
 
@@ -243,7 +252,7 @@ KV Cache 公式中的 `kv_heads` 直接对应注意力头的组织方式，不�
 
 KV Cache 是 LLM 推理显存与带宽的枢纽——既是显存大头（长上下文 / 长生成下线性爆炸），又是 decode 带宽瓶颈（每步要读全部 KV）。几乎所有推理优化都围着它转。
 
-* **本质与规模**：自回归 decode 每步只需新 K/V，但注意力要用历史全部 K/V → 缓存它们避免每步重算 prefill。规模见 1.1 公式，长上下文 / 长生成下线性爆炸（长 CoT 模型尤甚）。
+* **本质与规模**：自回归 decode 每步只需新 K/V，但注意力要用历史全部 K/V → 缓存它们避免每步重算 prefill。规模见 1.4 公式，长上下文 / 长生成下线性爆炸（长 CoT 模型尤甚）。
 * **分页管理 [PagedAttention](https://arxiv.org/abs/2309.06180)**：物理块(block) + 每请求逻辑块表(block table) + 按需分配，借鉴 OS 虚拟内存——消除碎片化与预分配虚高，vLLM 的核心。
 * **复用 / 前缀缓存**：多请求共享公共前缀（system prompt / few-shot）的 KV → 省 prefill。[SGLang RadixAttention](https://arxiv.org/abs/2312.07104)（基数树）+ vLLM 自动前缀缓存(APC)。
 * **量化**：KV 用更少比特存——[KIVI](https://arxiv.org/abs/2402.02750)（K 按通道 / V 按 token 非对称 2bit）、FP8 KV——直接减 decode 带宽（呼应 2.2）。
