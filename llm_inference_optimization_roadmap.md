@@ -62,7 +62,7 @@
 
 把这套框架套到推理的两阶段：
 
-* **Roofline 公式**：$$\text{Arithmetic Intensity} = \frac{\text{计算量 (FLOPs)}}{\text{内存访问量 (Bytes)}}$$
+* **Roofline 公式**：$$\text{Arithmetic Intensity} = \frac{\text{FLOPs}}{\text{Bytes}}$$
   * **Prefill 阶段**：一次处理 $N$ 个输入 token。注意力 $O(N^2 \cdot d)$、线性投影 $O(N \cdot d^2)$，总前向 FLOPs $\approx 2 \times \text{params} \times N$（2 为乘累加系数）；算术强度高 → 落在算力段 → **Compute-Bound**。
   * **Decode 阶段**：逐 token 自回归，每步只算 1 个 token，却要把整套权重 + 历史 KV 从 HBM 搬到 SRAM——算术强度极低（常 $<10$）→ 落在带宽段 → **Memory-Bound**。这也是 KV 量化、FlashAttention decode、CUDA Graph（见 4.5）等带宽优化的主战场。
 
