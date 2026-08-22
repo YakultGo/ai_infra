@@ -98,6 +98,8 @@ KV Cache 公式中的 `kv_heads` 直接对应注意力头的组织方式，不�
 
 掌握近年大模型推理领域的经典与前沿论文，重点理解其“为了解决什么硬件/系统矛盾”而提出。按主题分组如下。
 
+> 📖 怎么读：别从头读到尾——先读 abstract + figure 搞清“解决什么矛盾、怎么解”，再带着问题精读方法部分；配合 kipply 博文 / 3B1B 视频 / 李宏毅讲座补背景；源码挑一个对应实现对照（如 PagedAttention → vLLM `block_pool`）。
+
 > 注：本节链接已于 2026-08-21 核验（arXiv ID 经 arXiv API、GitHub 仓库经 GitHub API、ORCA 经 DBLP+USENIX、kipp.ly 博文经直连）。ORCA 为 USENIX OSDI '22 会议论文、未上 arxiv，故用其官方会议链接。
 
 ### 2.1 显存分页与 IO 优化
@@ -258,11 +260,15 @@ KV Cache 是 LLM 推理显存与带宽的枢纽——既是显存大头（长上
   2. Fused Softmax（融合 Softmax）
   3. FlashAttention-2 极简实现
 
+**📖 入门**：先跑 Triton 官方 fused-softmax 教程（看懂 block / tile 划分），再改 block_size 看性能曲线；FlashAttention 极简版可参考 Triton 教程里的 attention 实现。
+
 > 📝 作业（4.1）：用 Triton 写一个 fused softmax kernel，对比 PyTorch baseline 的正确性与耗时；再读 FlashAttention-2 极简实现。跑通且对齐即完成。
 
 ### 4.2 前沿工业级算子库（DeepSeek 开源精粹）
 * [DeepSeek DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)：极轻量高性能 FP8 GEMM 矩阵乘法算子库。
 * [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP)：专为 MoE 架构设计的节点间全连接通信库。
+
+**📖 入门**：DeepGEMM / DeepEP 都先读 README 的 bench 与用法，再看 `deep_gemm/` / `deep_ep/` 下的 kernel 源码；需 Hopper（FP8 / NVLink）环境才能跑真性能，没有可在文档 / trace 层面理解。
 
 > 衔接：DeepGEMM 的 FP8 GEMM 属“反量化-融合 GEMM”，需先理解阶段二的 FP8 量化（E4M3/E5M2）与 DeepSeek-V3 的 FP8 实践，再回到这里看它如何把反量化融进矩阵乘。
 
@@ -308,6 +314,8 @@ KV Cache 是 LLM 推理显存与带宽的枢纽——既是显存大头（长上
 * **图编译**：GE(Graph Engine) 做图级融合 / 编排，对标 XLA / Inductor（呼应 4.5）。
 * **推理生态**：MindIE（昇腾推理引擎，JD 高频）、[vLLM-Ascend](https://github.com/vllm-project/vllm-ascend)（vLLM 的昇腾后端）、[Ascend Samples](https://github.com/Ascend)（CANN 算子样例）。
 * **与 CUDA 的差异**：NPU 的 AI Core（Cube / Vector 协同）vs GPU Tensor Core；显存层次与编程模型不同——同一算法常需重写 / 重调优。
+
+**📖 入门**：先读 [CANN 文档](https://www.hiascend.com/document/detail/en/CANNcommercial) 的 Ascend C 算子开发章节，跑 [Ascend Samples](https://github.com/Ascend) 里的样例；需昇腾卡，没有就停在文档 / 架构理解层面（呼应个人可行性）。
 
 > 📝 作业（4.6）：① 一句话说清 CANN 分别对标 CUDA 的哪几层；② vLLM-Ascend 要把 vLLM 的哪些 CUDA 依赖替换 / 适配为昇腾？答清即完成。
 
@@ -520,6 +528,8 @@ class Engine:
 * [DeepSpeed](https://github.com/microsoft/DeepSpeed)：ZeRO 系列显存优化 + 3D 并行 + 通信优化。
 * **PyTorch FSDP / JAX pjit**：原生分片并行（FSDP 与[激活检查点](https://pytorch.org/docs/stable/checkpoint.html)配合）。
 * **显存技巧 / 以存代算**：activation checkpointing（算力换显存）、ZeRO 分片、CPU offload、混合精度（BF16 / FP8，呼应 2.2）——“以存代算”（用算力 / 带宽换显存）的工程统称，JD 高频词。
+
+**📖 入门**：DeepSpeed 跑 `examples/` 下的 ZeRO 训练 example（小模型单卡可跑通）；Megatron-LM 跑 `examples/` 里的 GPT 小模型脚本看 TP / PP；没有多卡就用 `--num-gpus 1` + 小 `--tensor-model-parallel-size` 缩放。
 
 > 📝 作业（6.3）：① activation checkpointing 为何“算力换显存”？省的是哪部分、重算的是哪部分？② ZeRO-1 / 2 / 3 各切什么、显存换算力代价递增在哪？答清即完成。
 
