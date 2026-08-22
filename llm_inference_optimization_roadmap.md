@@ -28,7 +28,7 @@
    - [4.6 昇腾 CANN 算子](#46-昇腾-cann-算子)
 5. [阶段五：核心实战项目与工程级实现](#阶段五核心实战项目与工程级实现)
    - [5.1 项目一：EAGLE 风格 Tree Attention 投机解码器](#51-项目一eagle-风格-tree-attention-投机解码器)
-   - [5.2 项目二：Mini-PagedAttention 与 Continuous Batching 调度器](#52-项目二mini-pagedattention-与-continuous-batching-调度器)
+   - [5.2 项目二：nano-vllm 最小推理引擎](#52-项目二nano-vllm-最小推理引擎)
    - [5.3 项目三：MaaS 高并发场景压测与 nsys Profiling 管线](#53-项目三maas-高并发场景压测与-nsys-profiling-管线)
    - [5.4 项目四（选做）：多 LoRA 混批 / INT4 反量化 GEMM](#54-项目四选做多-lora-混批服务-或-int4-在线反量化-gemm)
    - [5.5 项目五：模型编译加速](#55-项目五模型编译加速)
@@ -223,6 +223,14 @@ KV Cache 是 LLM 推理显存与带宽的枢纽——既是显存大头（长上
 * **FlashInfer**：生产级注意力 kernel 库，块稀疏注意力 + 专门优化的 MLA kernel，是高效服务 DeepSeek（MLA）的关键依赖，已被 vLLM/SGLang 集成。
   * [FlashInfer GitHub](https://github.com/flashinfer-ai/flashinfer)
 
+**📖 入门路径（每个引擎怎么起步，新手向）**：
+
+* **vLLM**：`pip install vllm` → `vllm serve <model>` 起一个服务 → 打断点跟一个请求 `vllm/v1/core/sched/scheduler.py`→`block_pool.py`→`gpu_model_runner.py` → 改 batch size 看吞吐变化。
+* **SGLang**：`pip install sglang` → `python -m sglang.launch_server` 起服务 → 读 RadixAttention 的前缀命中 → 试 regex/JSON 结构化生成。
+* **TensorRT-LLM**：用 `trtllm-build` 把 HF 模型编译成 engine → 跑 benchmark 看吞吐 → 读 `cpp/tensorrt_llm/` 下的 attention / MLP plugin。
+* **llama.cpp**：`make` 编译 + 下一个 GGUF 量化模型 → `./llama-cli -m model.gguf -p '你好'` 跑推理 → 读 `llama_decode` / KV 管理看极简实现。
+* **FlashInfer**：`pip install flashinfer` → 在 vLLM 里设 attention backend=FLASHINFER 跑一下 → 读 `flashinfer/decode.py` 的 paged decode kernel。
+
   🎧 **延伸播客**：Latent Space — [The Inference Engineering Masterclass (Baseten，推理工程实战)](https://www.latent.space/p/inference-eng)；Practical AI — [Serverless GPUs (ep211)](https://changelog.com/practicalai/211)。
 
 **vLLM / SGLang 内部结构（深入）**：
@@ -354,9 +362,9 @@ def build_tree_attention_mask(tree_structure, prefix_len):
 
 ---
 
-### 5.2 项目二：Mini-PagedAttention 与 Continuous Batching 调度器
+### 5.2 项目二：nano-vllm 最小推理引擎
 
-**目标**：手写包含显存池管理、物理/逻辑块映射与连续批处理（Continuous Batching）的核心引擎调度框架。
+**目标**：从零搭一个最小推理引擎，把 PagedAttention（分页 KV）+ 连续批处理 + decode loop 串成端到端——即一个 nano-vllm。参考实现：[GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)（PyTorch 极简 vLLM）、[karpathy/llama2.c](https://github.com/karpathy/llama2.c)（单文件 C 推理引擎）。
 
 ```python
 class BlockAllocator:
@@ -395,7 +403,33 @@ class ContinuousBatchScheduler:
         pass
 ```
 
-> 📝 作业（5.2）：给 `ContinuousBatchScheduler.step()` 补全三步（waiting→running 调度、decode 分配 KV 块、遇 EOS 释放），并实现最简 LRU 抢占（显存不足时踢出最长未动请求）。跑通单测即完成。
+```python
+class Engine:
+    """最小推理引擎：调度器 + 分页 KV + 模型 forward，跑连续批处理 decode"""
+    def __init__(self, model, allocator: BlockAllocator):
+        self.model = model                              # 任意 nn.Module（或 forward stub）
+        self.scheduler = ContinuousBatchScheduler(allocator)
+
+    def step(self):
+        # 1. 调度：waiting→running、为新 token 申请 KV 块(decode)、遇 EOS 释放
+        batch = self.scheduler.step()
+        # 2. 一次 forward（prefill+decode 混批）：读 block_tables 里的 paged KV
+        logits = self.model(batch.token_ids, kv_block_tables=self.scheduler.allocator.block_tables)
+        # 3. GPU 侧采样下一 token，追加进对应请求
+        next_tokens = self.model.sample(logits)
+        for req, tok in zip(batch.reqs, next_tokens):
+            req.append_token(tok)
+        return batch
+
+# 用法：3 个并发请求 → 连续批处理直到全部 <EOS>
+# engine = Engine(model, BlockAllocator(num_blocks=1024, block_size=16))
+# while engine.scheduler.has_active():
+#     engine.step()
+```
+
+> 参考：[nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) 把这套做成可跑的最小实现（paged KV + continuous batching + prefill/decode 分离），可对照阅读；[llama2.c](https://github.com/karpathy/llama2.c) 是单文件 C 的极简推理引擎。
+
+> 📝 作业（5.2）：① 给 `ContinuousBatchScheduler.step()` 补全三步（waiting→running 调度、decode 分配 KV 块、遇 EOS 释放）+ 最简 LRU 抢占；② 在 `Engine.step()` 上接一个 forward stub + 采样，跑通 3 个并发请求直到全部 EOS。跑通即完成。
 
 ---
 
