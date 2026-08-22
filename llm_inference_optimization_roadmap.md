@@ -58,14 +58,15 @@
 
 ### 1.1 Roofline：算力与带宽瓶颈
 
-**入门直觉**：把 GPU 想象成两个工人——一个算得飞快（**算力**）、一个搬货慢吞吞（**带宽**）。Prefill 一次性送来一大摞货（N 个 token），算力忙不过来 → 算力受限（Compute-Bound）；Decode 每次只搬一个 token、却要把整套参数和 KV 都从显存搬一遍，工人大部分时间在等货 → 带宽受限（Memory-Bound）。本节就是把这种“感觉”量化成可算的数字。
+推理的快慢由两件事抢：**算力（GPU 每秒能算多少 FLOP）**和**带宽（显存每秒能搬多少 Byte）**。Roofline 模型用一条折线把两者统一起来——横轴是“算术强度（FLOP/Byte）”，纵轴是吞吐（FLOP/s）；折线先随带宽上升、到“脊点（ridge point）”后被算力封顶。一个 kernel 卡在哪，就看算术强度落在线的哪段：低于脊点→带宽受限（memory-bound），高于→算力受限（compute-bound）。
 
-* **Roofline Model（算力瓶颈判定）**：
-  $$\text{Arithmetic Intensity (算术强度)} = \frac{\text{计算量 (FLOPs)}}{\text{内存访问量 (Bytes)}}$$
-  * **Prefill 阶段**：处理 $N$ 个输入 Token。注意力部分计算量约 $O(N^2 \cdot d)$、线性投影约 $O(N \cdot d^2)$，总体前向 FLOPs $\approx 2 \times \text{params} \times N$（2 为矩阵乘的乘累加系数，与 Token 数线性相关）；算术强度高，通常属于 **Compute-Bound（计算密集型）**。
-  * **Decode 阶段**：逐字自回归生成，每次仅输入 1 个 Token，参数与 KV Cache 必须逐字节从 HBM/显存搬运至 SRAM，算术强度极低（通常 $<10$），属于 **Memory-Bound（访存受限型）**。
+把这套框架套到推理的两阶段：
 
-> 📝 作业（1.1）：① 给定某模型 prefill / decode 的 FLOPs 与访存字节数，分别判断属 compute-bound 还是 memory-bound；② 为什么 decode 单步算术强度通常 <10？答清即完成。
+* **Roofline 公式**：$$\text{Arithmetic Intensity} = \frac{\text{计算量 (FLOPs)}}{\text{内存访问量 (Bytes)}}$$
+  * **Prefill 阶段**：一次处理 $N$ 个输入 token。注意力 $O(N^2 \cdot d)$、线性投影 $O(N \cdot d^2)$，总前向 FLOPs $\approx 2 \times \text{params} \times N$（2 为乘累加系数）；算术强度高 → 落在算力段 → **Compute-Bound**。
+  * **Decode 阶段**：逐 token 自回归，每步只算 1 个 token，却要把整套权重 + 历史 KV 从 HBM 搬到 SRAM——算术强度极低（常 $<10$）→ 落在带宽段 → **Memory-Bound**。这也是 KV 量化、FlashAttention decode、CUDA Graph（见 4.5）等带宽优化的主战场。
+
+> 📝 作业（1.1）：① 给定某 prefill / decode 的 FLOPs 与访存字节数，分别判断属 compute- 还是 memory-bound，并说该优化算力还是带宽；② 为什么 decode 算术强度通常 <10？答清即完成。
 
 ### 1.2 必读文档与入门参考
 
@@ -83,24 +84,24 @@
 
 ### 1.3 Transformer 结构与前向算力
 
-**入门**：LLM = 堆叠的 Transformer block，每块 = 注意力 + MLP(FFN) + 残差 + 归一化。理解每块的算力 / 显存构成是推导的基础。
+一个 LLM 是几十上百层 Transformer block 堆出来的，每层 block 干同一件事：**先用自注意力让 token 互相看，再用 MLP（FFN）逐 token 变换，两路各加残差与归一化**。理解 block 的算力构成，才能算前向 FLOPs，也才看懂后续 PagedAttention / FlashAttention 改的是哪一块。
 
-* **block 结构**：Attention（QKV → softmax → V）+ MLP（两层线性 + 激活）+ 残差连接 + LayerNorm / RMSNorm。
-* **前向 FLOPs**：线性层（权重）主导 ≈ 2·P·N（见 1.1）；注意力 ≈ O(N²·d)（长序列才显著）；MLP 隐藏维通常取 4×d。
+* **block 结构**：Attention（QKV → softmax → V）+ MLP（两层线性 + 激活，隐藏维常 4×d）+ 残差连接 + LayerNorm/RMSNorm。MoE（1.8）就是把这里的 dense MLP 换成稀疏专家。
+* **前向 FLOPs**：线性层（权重）主导 ≈ 2·P·N（见 1.1）；注意力 ≈ O(N²·d)（仅长序列显著）；MLP 因隐藏维 4×d 而占大头——所以“模型算力 ≈ 权重 × token”。
 * **位置编码演进**：绝对位置 → 正弦 → 可学习 → **RoPE**（旋转 / 相对位置，外推友好，见 2.3）。
 * **残差与归一化**：残差让深网可训；归一化从 LayerNorm → RMSNorm（省均值、更快）。
 
-> 📝 作业（1.3）：① 一个 block 的前向 FLOPs 主要花在哪（attention 还是 MLP）？为什么 MLP 隐藏维常取 4×d？② RoPE 相对绝对位置编码好在哪？答清即完成。
+> 📝 作业（1.3）：① 一个 block 的前向 FLOPs 主要花在 attention 还是 MLP？为什么 MLP 隐藏维常取 4×d？② RoPE 相对绝对位置编码好在哪？答清即完成。
 
 ### 1.4 KV Cache 显存推导
 
-KV Cache 是自回归 decode 为避免重算历史而缓存的 K/V——其大小直接决定长上下文 / 长生成的显存压力（先懂 Transformer 自回归，再看 KV 才顺）。
+自回归 decode 时，每生成一个 token 都要对“所有历史 token”做注意力——若每次重算历史 K/V，等于每步重跑 prefill，太贵。于是把历史 K、V 缓存下来（KV Cache），每步只算新 token 的 K/V 追加进去。代价是这块缓存随序列长度线性增长，长上下文 / 长生成时会反超权重本身成为显存大头。
 
-* **精准计算公式**（以 FP16/BF16 2 字节为例）：
+* **精准公式**（FP16/BF16 2 字节）：
   $$\text{KV Cache Size (Bytes)} = 2 \times \text{layers} \times (2 \times \text{kvHeads} \times \text{headDim}) \times \text{seqLen} \times \text{batchSize}$$
-  > 外层 2 = 字节数，内层 2 = K & V；`kvHeads` 取决于注意力变体（见 1.5）。
+  > 外层 2 = 字节数，内层 2 = K & V；`kvHeads` 由注意力变体决定（见 1.5）。
 
-> 算一算：Llama-2-7B（32 层、32 头 MHA、head_dim=128），seq=4K、batch=1、FP16 → KV Cache = 2(字节) × 32(层) × (2×32×128) × 4096 ≈ **2 GB**；到 seq=32K 时膨胀到 ~16 GB，反超模型权重本身（~14 GB）——这就是 decode 阶段显存/带宽成为命门的原因。
+> 算一算：Llama-2-7B（32 层、32 头 MHA、head_dim=128），seq=4K、batch=1、FP16 → 2×32×(2×32×128)×4096 ≈ **2 GB**；到 seq=32K 膨胀到 ~16 GB，反超权重（~14 GB）——这就是 decode 显存/带宽成为命门的原因。
 
 > 📝 作业（1.4）：① 不看公式，口算 FP16 下“每层每 token 的 KV 字节 = 2(字节)×2(K,V)×kv_heads×head_dim”，并推广到 GQA；② 解释为何 seq 翻倍时 KV 翻倍、但 decode 单步算术强度几乎不变（仍是带宽瓶颈）。答清即完成。
 
