@@ -62,9 +62,9 @@
 
 把这套框架套到推理的两阶段：
 
-* **Roofline 公式**：$$\text{Arithmetic Intensity} = \frac{\text{FLOPs}}{\text{Bytes}}$$
-  * **Prefill 阶段**：一次处理 $N$ 个输入 token。注意力 $O(N^2 \cdot d)$、线性投影 $O(N \cdot d^2)$，总前向 FLOPs $\approx 2 \times \text{params} \times N$（2 为乘累加系数）；算术强度高 → 落在算力段 → **Compute-Bound**。
-  * **Decode 阶段**：逐 token 自回归，每步只算 1 个 token，却要把整套权重 + 历史 KV 从 HBM 搬到 SRAM——算术强度极低（常 $<10$）→ 落在带宽段 → **Memory-Bound**。这也是 KV 量化、FlashAttention decode、CUDA Graph（见 4.5）等带宽优化的主战场。
+* **Roofline 公式**：`Arithmetic Intensity = FLOPs / Bytes`
+  * **Prefill 阶段**：一次处理 N 个输入 token。注意力 O(N²·d)、线性投影 O(N·d²)，总前向 FLOPs ≈ 2 × params × N（2 为乘累加系数）；算术强度高 → 落在算力段 → **Compute-Bound**。
+  * **Decode 阶段**：逐 token 自回归，每步只算 1 个 token，却要把整套权重 + 历史 KV 从 HBM 搬到 SRAM——算术强度极低（常 <10）→ 落在带宽段 → **Memory-Bound**。这也是 KV 量化、FlashAttention decode、CUDA Graph（见 4.5）等带宽优化的主战场。
 
 > 📝 作业（1.1）：① 给定某 prefill / decode 的 FLOPs 与访存字节数，分别判断属 compute- 还是 memory-bound，并说该优化算力还是带宽；② 为什么 decode 算术强度通常 <10？答清即完成。
 
@@ -98,7 +98,7 @@
 自回归 decode 时，每生成一个 token 都要对“所有历史 token”做注意力——若每次重算历史 K/V，等于每步重跑 prefill，太贵。于是把历史 K、V 缓存下来（KV Cache），每步只算新 token 的 K/V 追加进去。代价是这块缓存随序列长度线性增长，长上下文 / 长生成时会反超权重本身成为显存大头。
 
 * **精准公式**（FP16/BF16 2 字节）：
-  $$\text{KV Cache Size (Bytes)} = 2 \times \text{layers} \times (2 \times \text{kvHeads} \times \text{headDim}) \times \text{seqLen} \times \text{batchSize}$$
+  `KV Cache (Bytes) = 2 × layers × (2 × kvHeads × headDim) × seqLen × batchSize`
   > 外层 2 = 字节数，内层 2 = K & V；`kvHeads` 由注意力变体决定（见 1.5）。
 
 > 算一算：Llama-2-7B（32 层、32 头 MHA、head_dim=128），seq=4K、batch=1、FP16 → 2×32×(2×32×128)×4096 ≈ **2 GB**；到 seq=32K 膨胀到 ~16 GB，反超权重（~14 GB）——这就是 decode 显存/带宽成为命门的原因。
