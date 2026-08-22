@@ -63,7 +63,7 @@
   * **Prefill 阶段**：处理 $N$ 个输入 Token。注意力部分计算量约 $O(N^2 \cdot d)$、线性投影约 $O(N \cdot d^2)$，总体前向 FLOPs $\approx 2 \times \text{params} \times N$（2 为矩阵乘的乘累加系数，与 Token 数线性相关）；算术强度高，通常属于 **Compute-Bound（计算密集型）**。
   * **Decode 阶段**：逐字自回归生成，每次仅输入 1 个 Token，参数与 KV Cache 必须逐字节从 HBM/显存搬运至 SRAM，算术强度极低（通常 $<10$），属于 **Memory-Bound（访存受限型）**。
 * **KV Cache 显存精准计算公式**（以 FP16/BF16 2 字节为例）：
-  $$\text{KV Cache Size (Bytes)} = 2 \times \text{layers} \times (2 \times \text{kv\_heads} \times \text{head\_dim}) \times \text{seq\_len} \times \text{batch\_size}$$
+  $$\text{KV Cache Size (Bytes)} = 2 \times \text{layers} \times (2 \times \text{kvHeads} \times \text{headDim}) \times \text{seqLen} \times \text{batchSize}$$
 
 > 算一算：Llama-2-7B（32 层、32 头 MHA、head_dim=128），seq=4K、batch=1、FP16 → KV Cache = 2(字节) × 32(层) × (2×32×128) × 4096 ≈ **2 GB**；到 seq=32K 时膨胀到 ~16 GB，反超模型权重本身（~14 GB）——这就是 decode 阶段显存/带宽成为命门的原因。
 
