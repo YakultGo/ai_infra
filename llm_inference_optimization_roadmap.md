@@ -9,6 +9,9 @@
    - [1.1 核心概念与推导](#11-核心概念与推导)
    - [1.2 必读文档与入门参考](#12-必读文档与入门参考)
    - [1.3 注意力变体与 KV Cache 的关系](#13-注意力变体与-kv-cache-的关系)
+   - [1.4 Transformer 结构与前向算力](#14-transformer-结构与前向算力)
+   - [1.5 GPU 硬件与显存层次](#15-gpu-硬件与显存层次)
+   - [1.6 精度与常用算子元素](#16-精度与常用算子元素)
 2. [阶段二：核心论文与突破性算法](#阶段二核心论文与突破性算法)
    - [2.1 显存分页与 IO 优化](#21-显存分页与-io-优化)
    - [2.2 量化（Quantization）](#22-量化quantization)
@@ -92,6 +95,39 @@ KV Cache 公式中的 `kv_heads` 直接对应注意力头的组织方式，不�
 
 > 📝 作业（1.3）：① 一句话说清 MHA / MQA / GQA 在 KV 显存上的取舍；② MLA 凭什么砍掉约 93% KV、却又与标准 FlashAttn 不兼容？答清即完成。
 
+### 1.4 Transformer 结构与前向算力
+
+**入门**：LLM = 堆叠的 Transformer block，每块 = 注意力 + MLP(FFN) + 残差 + 归一化。理解每块的算力 / 显存构成是推导的基础。
+
+* **block 结构**：Attention（QKV → softmax → V）+ MLP（两层线性 + 激活）+ 残差连接 + LayerNorm / RMSNorm。
+* **前向 FLOPs**：线性层（权重）主导 ≈ 2·P·N（见 1.1）；注意力 ≈ O(N²·d)（长序列才显著）；MLP 隐藏维通常取 4×d。
+* **位置编码演进**：绝对位置 → 正弦 → 可学习 → **RoPE**（旋转 / 相对位置，外推友好，见 2.3）。
+* **残差与归一化**：残差让深网可训；归一化从 LayerNorm → RMSNorm（省均值、更快）。
+
+> 📝 作业（1.4）：① 一个 block 的前向 FLOPs 主要花在哪（attention 还是 MLP）？为什么 MLP 隐藏维常取 4×d？② RoPE 相对绝对位置编码好在哪？答清即完成。
+
+### 1.5 GPU 硬件与显存层次
+
+**入门**：推理瓶颈的根因在硬件——理解 SM / Tensor Core / 显存层次，才能懂为什么 decode 是带宽受限。
+
+* **计算单元**：SM（流多处理器）、Tensor Core / MMA（矩阵乘单元，Hopper 的 wgmma）、CUDA core。
+* **显存层次**：寄存器(register) → SRAM / 共享内存 → L1 / L2 → **HBM（显存）**，越外越大越慢；权重 / KV 在 HBM，每步要搬到 SRAM 算。
+* **算术强度与瓶颈**：算术强度 = FLOPs / Bytes；低于 GPU 的“脊点(ops:byte)”→ 带宽受限，高于→算力受限。Decode 每步搬整个权重 + KV 却只算 1 token → 强度极低 → **memory-bound**（呼应 1.1）。
+* **occupancy / kernel launch**：多 kernel 串行有 CPU launch 开销（CUDA Graph 解决，呼应 4.5）。
+
+> 📝 作业（1.5）：① 为什么 decode 把权重从 HBM 搬到 SRAM 却“大部分时间在等”？用算术强度解释。② Tensor Core 与 CUDA core 的区别？答清即完成。
+
+### 1.6 精度与常用算子元素
+
+**入门**：推理里到处是精度取舍与几个反复出现的小算子，先认全。
+
+* **精度**：FP32（训练基线）/ **FP16 · BF16**（推理默认，2 字节）/ **FP8**（Hopper / Blackwell，见 2.2）/ INT8 / INT4（量化）。BF16 动态范围大、FP16 精度高。
+* **归一化**：LayerNorm（含均值）→ **RMSNorm**（只算方差，省、快，Llama 等用）。
+* **激活**：GELU（早期）→ **SiLU / SwiGLU**（Llama 等，门控式，常与线性层融合）。
+* **采样**：greedy / top-k / top-p / temperature（在 GPU 侧做，见 4.4 采样 kernel）。
+
+> 📝 作业（1.6）：① BF16 与 FP16 各适合什么？为什么推理默认 BF16 / FP16？② RMSNorm 比 LayerNorm 省在哪？答清即完成。
+
 ---
 
 ## 阶段二：核心论文与突破性算法
@@ -128,15 +164,37 @@ KV Cache 公式中的 `kv_heads` 直接对应注意力头的组织方式，不�
 
 ### 2.3 注意力架构与长上下文
 
-**入门**：注意力的“形状”直接决定 KV 多大——头共享得越多越省显存但质量越折损（MQA < GQA < MHA），MLA 则用低秩压缩另辟蹊径。长上下文靠 RoPE 外推（YaRN）和跨卡分片（Ring Attention）把窗口拉长。
+**入门**：注意力的“形状”决定 KV 多大、计算多贵。优化分三条演进线：① **KV 显存**（头怎么组织：MHA→MQA→GQA→MLA）；② **计算 / IO**（稀疏 / 线性近似→高效精确 FlashAttention）；③ **长上下文**（RoPE 外推 + 跨卡分片 + 滑窗）。下面按“之前→现在→将来”展开。
 
-| 论文名称与链接 | 核心突破与要点 |
-| :--- | :--- |
-| [DeepSeek-V2（MLA）](https://arxiv.org/abs/2405.04434) / [DeepSeek-V3](https://arxiv.org/abs/2412.19437) | **MLA** 将 K/V 压入低秩隐向量，KV Cache 相比 MHA 降 93.3%；但与标准 FlashAttn/PagedAttn 不兼容，催生专用 kernel（FlashInfer）。 |
-| [YaRN](https://arxiv.org/abs/2309.00071) | NTK-aware RoPE 外推，低成本扩展上下文长度（配合 PI / NTK 系列）。 |
-| Ring Attention / Context Parallelism（选读） | 跨 GPU 分片计算长序列注意力，突破单卡显存上限。 |
+**演进线一：KV 显存（头怎么组织）**
 
-> 📝 作业（2.3）：① 头数减半改 GQA，KV 缩多少、质量为何不线性恶化？② YaRN 与朴素 RoPE 外推在“远处衰减”上差在哪？答清即完成。
+| 阶段 | 论文 | 要点 |
+| :--- | :--- | :--- |
+| 之前 | [Attention Is All You Need](https://arxiv.org/abs/1706.03762) | MHA：每头独立 K/V，KV Cache 最大。 |
+| → | [MQA（One Write-Head）](https://arxiv.org/abs/1911.02150) | 所有 query 共享一组 K/V，KV 最小但质量损。 |
+| → | [GQA](https://arxiv.org/abs/2305.13245) | 分组共享（折中），质量近 MHA、KV 大降——Llama-2/3 等现主流。 |
+| 现在 / 将来 | [MLA（DeepSeek-V2）](https://arxiv.org/abs/2405.04434) | 低秩隐向量压缩 KV 约 93%，代价是不兼容标准 attention（需 FlashInfer）。 |
+
+**演进线二：计算 / IO（怎么算便宜）**
+
+* 之前：dense O(N²) attention。
+* **稀疏 / 线性近似**（大多被淘汰）：[BigBird](https://arxiv.org/abs/2007.14062) / [Longformer](https://arxiv.org/abs/2004.05150)（滑窗 + 全局稀疏）、[Linformer](https://arxiv.org/abs/2006.04768)（低秩投影）、[Performer](https://arxiv.org/abs/2009.14794)（kernel 近似）——追求 sub-quadratic，但精度 / 生态吃亏。
+* **现在（赢家）**：高效**精确** attention = [FlashAttention 1/2/3](https://arxiv.org/abs/2205.14135)（见 2.1），保持精确只优化 IO；+ 滑窗（Mistral 等用于超长上下文）。
+* 将来：硬件协同（FlashInfer for MLA、Blackwell 特性）+ 与 SSM 融合。
+
+**演进线三：长上下文（怎么把窗口拉长）**
+
+* 位置编码：[RoPE / RoFormer](https://arxiv.org/abs/2104.09864) → [YaRN](https://arxiv.org/abs/2309.00071)（NTK-aware 外推），让训练长度外的外推可行。
+* 跨卡：Ring Attention / Context Parallelism——长序列切多卡算注意力，突破单卡显存。
+* 架构级：滑窗 + 全局（Longformer / BigBird 思路在 Mistral 等复活）。
+
+**将来：sub-quadratic / 非 attention 架构**
+
+* [RetNet](https://arxiv.org/abs/2307.08621)：线性 RNN，号称 Transformer 继任者。
+* [Mamba](https://arxiv.org/abs/2312.00752)：selective SSM，线性时间。
+* **混合 attention-SSM**：Jamba 等用 Mamba + attention 混合，兼顾长上下文与质量——sub-quadratic、长上下文原生是方向。
+
+> 📝 作业（2.3）：① 把 MHA / MQA / GQA / MLA 按显存从小到大排，并说清各自“质量代价”；② 为什么稀疏 / 线性 attention（Linformer / Performer）大多被 FlashAttention 淘汰？③ Mamba / SSM 与 attention 混合（Jamba）想解决 attention 的什么根本问题？答对 2/3 即完成。
 
 ### 2.4 投机解码（Speculative Decoding）
 
@@ -629,7 +687,7 @@ class Engine:
 
 ## 总结与建议学习路线
 
-1. **第 1~2 周（理论）**：理解 Roofline 模型，推导 KV Cache 显存公式，搞清 MQA/GQA/MLA 对显存的影响；精读 *PagedAttention* 与 *FlashAttention-1/2*。
+1. **第 1~2 周（理论）**：理解 Roofline 与 GPU 显存层次，推导 KV Cache 显存公式，搞清 Transformer 结构 / MQA·GQA·MLA / 精度；精读 *PagedAttention* 与 *FlashAttention-1/2*。
 2. **第 3~4 周（投机解码 + 量化）**：实现树状 Attention 掩码与投机校验（注意 position ids），读 *EAGLE* / *Medusa* / *LayerSkip* / MTP，搞懂拒绝采样与自投机；同时过一遍 *GPTQ* / *AWQ* / *SmoothQuant* 与 KV Cache 量化。
 3. **第 5~6 周（服务架构）**：精读 *DistServe* / *Mooncake*（PD 分离）、ORCA / Sarathi-Serve（连续批处理与 chunked prefill）、*S-LoRA*（多租户 LoRA）。
 4. **第 7~10 周（引擎源码）**：克隆 vLLM，打断点阅读 `vllm/v1/core/sched/scheduler.py` 与 `kv_cache_manager.py`（见 3.1）；横向对比 TensorRT-LLM、FlashInfer（尤其 MLA kernel）、llama.cpp 的取舍。
